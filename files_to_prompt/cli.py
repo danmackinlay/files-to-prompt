@@ -34,14 +34,36 @@ def _git_repo_root():
     return _run_git(["rev-parse", "--show-toplevel"], os.getcwd())
 
 
-def _git_changed_paths_since(ref, repo_root):
-    # tracked changes
-    diff_out = _run_git(["diff", "--name-only", ref, "--"], repo_root)
-    tracked = set(line for line in diff_out.splitlines() if line)
+def _validate_git_ref(ref, repo_root):
+    try:
+        _run_git(["rev-parse", "--quiet", "--verify", f"{ref}^{{commit}}"], repo_root)
+    except click.ClickException as e:
+        raise click.ClickException(f"Invalid Git revision '{ref}'.")
 
-    # untracked (respect ignore rules always)
-    untracked_out = _run_git(["ls-files", "--others", "--exclude-standard"], repo_root)
-    untracked = set(line for line in untracked_out.splitlines() if line)
+
+def _git_changed_paths_since(ref, repo_root, scope="working"):
+    tracked = set()
+
+    if scope == "working":
+        # tracked changes between REF and working tree
+        diff_out = _run_git(["diff", "--name-only", ref, "--"], repo_root)
+        tracked = set(line for line in diff_out.splitlines() if line)
+    elif scope == "committed":
+        # only commits after REF
+        diff_out = _run_git(["diff", "--name-only", f"{ref}..HEAD", "--"], repo_root)
+        tracked = set(line for line in diff_out.splitlines() if line)
+    elif scope == "staged":
+        # only what's staged in index relative to REF
+        diff_out = _run_git(["diff", "--name-only", "--cached", ref, "--"], repo_root)
+        tracked = set(line for line in diff_out.splitlines() if line)
+
+    # untracked files only for working scope
+    untracked = set()
+    if scope == "working":
+        untracked_out = _run_git(
+            ["ls-files", "--others", "--exclude-standard"], repo_root
+        )
+        untracked = set(line for line in untracked_out.splitlines() if line)
 
     candidates = tracked | untracked
     # only existing files
@@ -296,6 +318,14 @@ def read_paths_from_stdin(use_null_separator):
         "In this mode, --ignore-gitignore is ignored."
     ),
 )
+@click.option(
+    "since_scope",
+    "--since-scope",
+    type=click.Choice(["working", "committed", "staged"]),
+    default="working",
+    show_default=True,
+    help="Which changes to include relative to REF: 'working' = commits after REF + staged + unstaged + untracked; 'committed' = commits after REF; 'staged' = index vs REF.",
+)
 @click.version_option()
 def cli(
     paths,
@@ -310,6 +340,7 @@ def cli(
     line_numbers,
     null,
     since_ref,
+    since_scope,
 ):
     """
     Takes one or more paths to files or directories and outputs every file,
@@ -366,7 +397,8 @@ def cli(
                 err=True,
             )
         repo_root = _git_repo_root()
-        changed = _git_changed_paths_since(since_ref, repo_root)
+        _validate_git_ref(since_ref, repo_root)
+        changed = _git_changed_paths_since(since_ref, repo_root, since_scope)
 
         # restrict to explicit paths if given
         if paths:
@@ -374,26 +406,32 @@ def cli(
             changed = {
                 rel
                 for rel in changed
-                if any(os.path.join(repo_root, rel).startswith(ap) for ap in abs_paths)
+                if any(
+                    os.path.commonpath([os.path.join(repo_root, rel), ap]) == ap
+                    for ap in abs_paths
+                )
             }
 
         # apply include_hidden / ignore / extensions filters
         rels = []
         for rel in sorted(changed):
+            rel_norm = os.path.normpath(rel.replace("/", os.sep))
             if not include_hidden and any(
-                part.startswith(".") for part in rel.split(os.sep)
+                part.startswith(".") for part in rel_norm.split(os.sep)
             ):
                 continue
             if extensions and not rel.endswith(tuple(extensions)):
                 continue
             if ignore_patterns:
-                base = os.path.basename(rel)
+                base = os.path.basename(rel_norm)
                 if ignore_files_only:
                     if any(fnmatch(base, pat) for pat in ignore_patterns):
                         continue
                 else:
-                    parts = rel.split(os.sep)
-                    if any(fnmatch(p, pat) for pat in ignore_patterns for p in parts):
+                    parts = rel_norm.split(os.sep)
+                    if any(
+                        fnmatch(part, pat) for part in parts for pat in ignore_patterns
+                    ):
                         continue
             rels.append(rel)
 
@@ -405,15 +443,23 @@ def cli(
         if claude_xml:
             writer("<documents>")
         for rel in rels:
-            abs_fp = os.path.join(repo_root, rel)
             try:
-                with open(abs_fp, "r") as f:
-                    print_path(
-                        writer, rel, f.read(), claude_xml, markdown, line_numbers
-                    )
-            except UnicodeDecodeError:
+                # For staged scope, read content from index; otherwise from working tree
+                if since_scope == "staged":
+                    content = _run_git(["show", f":{rel}"], repo_root)
+                else:
+                    abs_fp = os.path.join(repo_root, rel)
+                    with open(abs_fp, "r") as f:
+                        content = f.read()
+
+                print_path(writer, rel, content, claude_xml, markdown, line_numbers)
+            except (
+                UnicodeDecodeError,
+                subprocess.CalledProcessError,
+                click.ClickException,
+            ):
                 warning_message = (
-                    f"Warning: Skipping file {rel} due to UnicodeDecodeError"
+                    f"Warning: Skipping file {rel} due to Unicode/Git error"
                 )
                 click.echo(click.style(warning_message, fg="red"), err=True)
         if claude_xml:

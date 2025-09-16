@@ -369,7 +369,6 @@ def test_line_numbers(tmpdir):
     "input,extra_args",
     (
         ("test_dir1/file1.txt\ntest_dir2/file2.txt", []),
-        ("test_dir1/file1.txt\ntest_dir2/file2.txt", []),
         ("test_dir1/file1.txt\0test_dir2/file2.txt", ["--null"]),
         ("test_dir1/file1.txt\0test_dir2/file2.txt", ["-0"]),
     ),
@@ -463,7 +462,10 @@ def test_since_requires_git_repo(tmpdir):
         assert result.exit_code != 0
         # either output or stderr can contain the message depending on click version
         combined = (result.output or "") + (getattr(result, "stderr", "") or "")
-        assert "not a git repository" in combined
+        assert (
+            "requires running inside a Git repository" in combined
+            or "not a git repository" in combined
+        )
 
 
 def test_since_head_changes_and_untracked(tmpdir):
@@ -624,7 +626,7 @@ def test_since_ignores_ignore_gitignore_flag_with_warning(tmpdir):
 
         result = runner.invoke(cli, ["--since", "HEAD", "--ignore-gitignore"])
         # Should warn and still exclude the .log file
-        # Check both output and stderr for the warning
+        # Check both output and stderr for the warning (click versions vary)
         combined = (result.output or "") + (getattr(result, "stderr", "") or "")
         assert "ignored with --since" in combined
         assert "a.py" in result.output
@@ -666,3 +668,418 @@ def test_since_respects_path_restrictions(tmpdir):
         out = result.output
         assert "src/a.py" in out
         assert "tests/t_test.py" not in out
+
+
+def test_since_scope_committed(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+
+        # Create initial commit
+        with open("a.py", "w") as f:
+            f.write("initial\n")
+        _git(["add", "a.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+            os.getcwd(),
+        )
+
+        # Create base commit after which we want to see changes
+        with open("b.py", "w") as f:
+            f.write("base\n")
+        _git(["add", "b.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # Get the base commit hash
+        base_commit = _git(["rev-parse", "HEAD"], os.getcwd()).stdout.strip()
+
+        # Make a committed change after base
+        with open("c.py", "w") as f:
+            f.write("committed\n")
+        _git(["add", "c.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "committed",
+            ],
+            os.getcwd(),
+        )
+
+        # Make staged and unstaged changes + untracked file
+        with open("d.py", "w") as f:
+            f.write("staged\n")
+        _git(["add", "d.py"], os.getcwd())  # staged
+
+        with open("e.py", "w") as f:
+            f.write("unstaged\n")  # unstaged
+
+        with open("f.py", "w") as f:
+            f.write("untracked\n")  # untracked
+
+        # Test committed scope: should only show c.py (committed after base)
+        result = runner.invoke(
+            cli, ["--since", base_commit, "--since-scope", "committed"]
+        )
+        assert result.exit_code == 0
+        out = result.output
+        assert "c.py" in out
+        assert "committed" in out
+        assert "d.py" not in out  # staged, not committed
+        assert "e.py" not in out  # unstaged
+        assert "f.py" not in out  # untracked
+
+
+def test_since_scope_staged(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+
+        # Create base commit
+        with open("a.py", "w") as f:
+            f.write("base\n")
+        _git(["add", "a.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # Stage a change
+        with open("a.py", "w") as f:
+            f.write("staged change\n")
+        _git(["add", "a.py"], os.getcwd())
+
+        # Make an unstaged change on top
+        with open("a.py", "w") as f:
+            f.write("staged change\nplus unstaged\n")
+
+        # Add untracked file
+        with open("untracked.py", "w") as f:
+            f.write("untracked\n")
+
+        # Test staged scope: should only show staged changes
+        result = runner.invoke(cli, ["--since", "HEAD", "--since-scope", "staged"])
+        assert result.exit_code == 0
+        out = result.output
+        assert "a.py" in out
+        assert "staged change" in out
+        assert "plus unstaged" not in out  # unstaged part not included
+        assert "untracked.py" not in out  # untracked not included
+
+
+def test_since_scope_working_includes_all(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+
+        # Create base commit
+        with open("a.py", "w") as f:
+            f.write("base\n")
+        _git(["add", "a.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # Modify tracked file (unstaged)
+        with open("a.py", "w") as f:
+            f.write("modified\n")
+
+        # Stage a new file
+        with open("staged.py", "w") as f:
+            f.write("staged content\n")
+        _git(["add", "staged.py"], os.getcwd())
+
+        # Add untracked file
+        with open("untracked.py", "w") as f:
+            f.write("untracked content\n")
+
+        # Test working scope (default): should include all
+        result = runner.invoke(cli, ["--since", "HEAD", "--since-scope", "working"])
+        assert result.exit_code == 0
+        out = result.output
+        assert "a.py" in out
+        assert "modified" in out
+        assert "staged.py" in out
+        assert "staged content" in out
+        assert "untracked.py" in out
+        assert "untracked content" in out
+
+
+def test_since_scope_default_is_working(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+
+        # Create base commit
+        with open("a.py", "w") as f:
+            f.write("base\n")
+        _git(["add", "a.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # Add untracked file
+        with open("untracked.py", "w") as f:
+            f.write("untracked\n")
+
+        # Test that default behavior includes untracked (working scope)
+        result = runner.invoke(cli, ["--since", "HEAD"])
+        assert result.exit_code == 0
+        out = result.output
+        assert "untracked.py" in out
+        assert "untracked" in out
+
+
+def test_since_scope_committed_excludes_staged_unstaged_untracked(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+        # base commit (REF will be this HEAD)
+        with open("base.txt", "w") as f:
+            f.write("base\n")
+        _git(["add", "base.txt"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # create committed change after REF
+        with open("committed_only.py", "w") as f:
+            f.write("c1\n")
+        _git(["add", "committed_only.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "commit after ref",
+            ],
+            os.getcwd(),
+        )
+
+        # also create staged, unstaged, and untracked noise
+        with open("mix.txt", "w") as f:
+            f.write("v1\n")
+        _git(["add", "mix.txt"], os.getcwd())  # staged
+        with open("unstaged.txt", "w") as f:
+            f.write("u1\n")  # unstaged (tracked only if added later—so keep untracked)
+        with open("untracked.md", "w") as f:
+            f.write("new\n")  # untracked
+
+        # since-scope=committed should ONLY show committed_only.py
+        result = runner.invoke(cli, ["--since", "HEAD~1", "--since-scope", "committed"])
+        assert result.exit_code == 0
+        out = result.output
+        assert "committed_only.py" in out
+        assert "mix.txt" not in out
+        assert "unstaged.txt" not in out
+        assert "untracked.md" not in out
+
+
+def test_since_scope_staged_includes_only_staged(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+        # base commit
+        with open("a.txt", "w") as f:
+            f.write("v1\n")
+        _git(["add", "a.txt"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # staged change to a.txt
+        with open("a.txt", "w") as f:
+            f.write("v2\n")
+        _git(["add", "a.txt"], os.getcwd())
+
+        # unstaged change on top of staged (same file) — remains staged at v2, working tree at v3
+        with open("a.txt", "w") as f:
+            f.write("v3\n")
+
+        # untracked file
+        with open("note.md", "w") as f:
+            f.write("doc\n")
+
+        # since-scope=staged: only a.txt should show up
+        result = runner.invoke(cli, ["--since", "HEAD", "--since-scope", "staged"])
+        assert result.exit_code == 0
+        out = result.output
+        assert "a.txt" in out
+        assert "note.md" not in out
+        # No other files
+        assert "base.txt" not in out
+
+
+def test_since_scope_working_includes_staged_unstaged_untracked(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+        # base commit
+        with open("tracked.py", "w") as f:
+            f.write("t1\n")
+        _git(["add", "tracked.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # staged change to tracked.py
+        with open("tracked.py", "w") as f:
+            f.write("t2\n")
+        _git(["add", "tracked.py"], os.getcwd())
+
+        # unstaged change to another tracked file (create + commit, then modify without staging)
+        with open("other.py", "w") as f:
+            f.write("o1\n")
+        _git(["add", "other.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "introduce other",
+            ],
+            os.getcwd(),
+        )
+        with open("other.py", "w") as f:
+            f.write("o2\n")  # unstaged change
+
+        # untracked file
+        with open("readme.md", "w") as f:
+            f.write("u\n")
+
+        # Default (working): should include staged (tracked.py), unstaged (other.py), and untracked (readme.md)
+        result = runner.invoke(cli, ["--since", "HEAD~1"])
+        assert result.exit_code == 0
+        out = result.output
+        assert "tracked.py" in out
+        assert "other.py" in out
+        assert "readme.md" in out
+
+
+def test_since_scope_default_equals_working(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+        # base commit
+        with open("base.txt", "w") as f:
+            f.write("b1\n")
+        _git(["add", "base.txt"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # Make one staged, one unstaged, one untracked
+        with open("staged.py", "w") as f:
+            f.write("s1\n")
+        _git(["add", "staged.py"], os.getcwd())
+
+        with open("unstaged.py", "w") as f:
+            f.write("u1\n")  # untracked (we won't add)
+        # also tweak base.txt unstaged
+        with open("base.txt", "w") as f:
+            f.write("b2\n")
+
+        # run twice: default & explicit working
+        res_default = runner.invoke(cli, ["--since", "HEAD"])
+        res_working = runner.invoke(
+            cli, ["--since", "HEAD", "--since-scope", "working"]
+        )
+        assert res_default.exit_code == 0
+        assert res_working.exit_code == 0
+
+        # Both should contain staged.py, base.txt (unstaged now differs), and unstaged.py (untracked)
+        for out in (res_default.output, res_working.output):
+            assert "staged.py" in out
+            assert "base.txt" in out
+            assert "unstaged.py" in out

@@ -196,24 +196,40 @@ find . -mtime -1 | files-to-prompt README.md
 Use `--since REF` to include only files that have changed since a given Git revision
 (commit SHA, tag, or branch).
 
-Includes:
-- Tracked changes between `REF` and your current working tree.
-- Untracked files (Git's ignore rules always apply).
-
-Notes:
-- Deleted files are not included.
-- Paths are repo-root-relative in this mode.
-- `--ignore-gitignore` is ignored (a warning is printed).
-
 Other filters (`-e/--extension`, `--ignore`, `--ignore-files-only`, `--include-hidden`) still apply.
 Passing paths (args or stdin) further restricts the set.
 
+#### Controlling what "changed since REF" means
+
+`--since REF` accepts an optional scope with `--since-scope`:
+
+- **working** (default): commits after `REF` + staged changes + unstaged changes,
+  plus untracked files (Git ignores respected).
+- **committed**: only commits after `REF` (no staged/unstaged/untracked).
+- **staged**: only files staged in the index relative to `REF` (no unstaged/untracked).
+
 Examples:
 ```bash
+# Default: everything in your working copy since REF
 files-to-prompt --since HEAD
+
+# Only what's been committed after REF
+files-to-prompt --since v1.2.0 --since-scope committed
+
+# Only what you've staged to commit (index vs REF)
+files-to-prompt --since HEAD --since-scope staged
+
+# Other examples with filters
 files-to-prompt --since abc123 -e py
 files-to-prompt --since main src tests
 ```
+
+Notes:
+- Paths are repo-root-relative in `--since` mode.
+- Deleted files are not emitted.
+- Untracked files are included **only** with `--since-scope working`.
+- `--ignore-gitignore` is ignored with `--since` (a warning is printed); Git's ignore rules are always used for untracked detection.
+- `-e/--extension`, `--ignore`, `--ignore-files-only`, `--include-hidden`, and path arguments/stdin still apply after the changed set is computed.
 
 ### Claude XML Output
 
