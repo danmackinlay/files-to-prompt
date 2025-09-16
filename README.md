@@ -191,6 +191,30 @@ You can mix and match paths from command line arguments and stdin:
 find . -mtime -1 | files-to-prompt README.md
 ```
 
+### Selecting files changed since a Git revision
+
+Use `--since REF` to include only files that have changed since a given Git revision
+(commit SHA, tag, or branch).
+
+Includes:
+- Tracked changes between `REF` and your current working tree.
+- Untracked files (Git's ignore rules always apply).
+
+Notes:
+- Deleted files are not included.
+- Paths are repo-root-relative in this mode.
+- `--ignore-gitignore` is ignored (a warning is printed).
+
+Other filters (`-e/--extension`, `--ignore`, `--ignore-files-only`, `--include-hidden`) still apply.
+Passing paths (args or stdin) further restricts the set.
+
+Examples:
+```bash
+files-to-prompt --since HEAD
+files-to-prompt --since abc123 -e py
+files-to-prompt --since main src tests
+```
+
 ### Claude XML Output
 
 Anthropic has provided [specific guidelines](https://docs.anthropic.com/claude/docs/long-context-window-tips) for optimally structuring prompts to take advantage of Claude's extended context window.

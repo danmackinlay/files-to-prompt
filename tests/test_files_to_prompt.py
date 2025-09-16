@@ -1,10 +1,22 @@
 import os
 import pytest
 import re
+import subprocess
 
 from click.testing import CliRunner
 
 from files_to_prompt.cli import cli
+
+
+def _git(cmd, cwd):
+    return subprocess.run(
+        ["git", *cmd],
+        cwd=cwd,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def filenames_from_cxml(cxml_string):
@@ -235,7 +247,7 @@ def test_mixed_paths_with_options(tmpdir):
 
 
 def test_binary_file_warning(tmpdir):
-    runner = CliRunner(mix_stderr=False)
+    runner = CliRunner()
     with tmpdir.as_cwd():
         os.makedirs("test_dir")
         with open("test_dir/binary_file.bin", "wb") as f:
@@ -246,15 +258,17 @@ def test_binary_file_warning(tmpdir):
         result = runner.invoke(cli, ["test_dir"])
         assert result.exit_code == 0
 
-        stdout = result.stdout
-        stderr = result.stderr
+        # Check output and stderr (may be combined)
+        output = result.output or ""
+        stderr = getattr(result, "stderr", "") or ""
+        combined = output + stderr
 
-        assert "test_dir/text_file.txt" in stdout
-        assert "This is a text file" in stdout
-        assert "\ntest_dir/binary_file.bin" not in stdout
+        assert "test_dir/text_file.txt" in output
+        assert "This is a text file" in output
+        assert "\ntest_dir/binary_file.bin" not in output
         assert (
             "Warning: Skipping file test_dir/binary_file.bin due to UnicodeDecodeError"
-            in stderr
+            in combined
         )
 
 
@@ -439,3 +453,216 @@ def test_markdown(tmpdir, option):
             "`````\n"
         )
         assert expected.strip() == actual.strip()
+
+
+def test_since_requires_git_repo(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        # Not a repo
+        result = runner.invoke(cli, ["--since", "HEAD"])
+        assert result.exit_code != 0
+        # either output or stderr can contain the message depending on click version
+        combined = (result.output or "") + (getattr(result, "stderr", "") or "")
+        assert "not a git repository" in combined
+
+
+def test_since_head_changes_and_untracked(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+        # base commit
+        with open("a.txt", "w") as f:
+            f.write("v1\n")
+        _git(["add", "a.txt"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # modify tracked + add untracked
+        with open("a.txt", "w") as f:
+            f.write("v2\n")
+        with open("b.txt", "w") as f:
+            f.write("new file\n")
+
+        result = runner.invoke(cli, ["--since", "HEAD"])
+        assert result.exit_code == 0
+        # repo-root-relative paths
+        assert "a.txt" in result.output
+        assert "b.txt" in result.output
+        assert "v2" in result.output
+        assert "new file" in result.output
+
+
+def test_since_respects_filters(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+
+        # Create .gitignore that ignores *.log (Git-level ignores)
+        with open(".gitignore", "w") as f:
+            f.write("*.log\n")
+        _git(["add", ".gitignore"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "gi",
+            ],
+            os.getcwd(),
+        )
+
+        # base commit
+        os.makedirs("pkg", exist_ok=True)
+        with open("pkg/keep.py", "w") as f:
+            f.write("base\n")
+        _git(["add", "pkg/keep.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # changes after base
+        with open("pkg/keep.py", "w") as f:
+            f.write("changed\n")
+        with open("note.md", "w") as f:
+            f.write("doc\n")
+        with open("tmp.log", "w") as f:
+            f.write("ignored by gitignore\n")
+        os.makedirs(".hidden_dir", exist_ok=True)
+        with open(".hidden_dir/x.txt", "w") as f:
+            f.write("hidden\n")
+
+        # 1) extension filter: only md, hidden excluded by default, gitignored excluded by Git
+        result = runner.invoke(cli, ["--since", "HEAD", "-e", "md"])
+        assert result.exit_code == 0
+        out = result.output
+        assert "note.md" in out
+        assert "pkg/keep.py" not in out
+        assert "tmp.log" not in out
+        assert ".hidden_dir/x.txt" not in out
+
+        # 2) include hidden: now hidden file appears, but gitignored (*.log) still excluded
+        result2 = runner.invoke(cli, ["--since", "HEAD", "--include-hidden"])
+        assert result2.exit_code == 0
+        out2 = result2.output
+        assert "pkg/keep.py" in out2
+        assert "note.md" in out2
+        assert ".hidden_dir/x.txt" in out2
+        assert "tmp.log" not in out2  # still excluded by Git ignore rules
+
+        # 3) tool-level ignore patterns: ignore *.md at the tool layer
+        result3 = runner.invoke(cli, ["--since", "HEAD", "--ignore", "*.md"])
+        assert result3.exit_code == 0
+        out3 = result3.output
+        assert "note.md" not in out3
+        assert "pkg/keep.py" in out3
+
+
+def test_since_ignores_ignore_gitignore_flag_with_warning(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+        with open(".gitignore", "w") as f:
+            f.write("*.log\n")
+        _git(["add", ".gitignore"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "gi",
+            ],
+            os.getcwd(),
+        )
+
+        # base commit
+        with open("a.py", "w") as f:
+            f.write("base\n")
+        _git(["add", "a.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        # change tracked; create ignored untracked
+        with open("a.py", "w") as f:
+            f.write("changed\n")
+        with open("build.log", "w") as f:
+            f.write("ignored by git\n")
+
+        result = runner.invoke(cli, ["--since", "HEAD", "--ignore-gitignore"])
+        # Should warn and still exclude the .log file
+        # Check both output and stderr for the warning
+        combined = (result.output or "") + (getattr(result, "stderr", "") or "")
+        assert "ignored with --since" in combined
+        assert "a.py" in result.output
+        assert "build.log" not in result.output
+
+
+def test_since_respects_path_restrictions(tmpdir):
+    runner = CliRunner()
+    with tmpdir.as_cwd():
+        _git(["init", "."], os.getcwd())
+
+        os.makedirs("src", exist_ok=True)
+        os.makedirs("tests", exist_ok=True)
+
+        with open("src/a.py", "w") as f:
+            f.write("v1\n")
+        _git(["add", "src/a.py"], os.getcwd())
+        _git(
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "base",
+            ],
+            os.getcwd(),
+        )
+
+        with open("src/a.py", "w") as f:
+            f.write("v2\n")
+        with open("tests/t_test.py", "w") as f:
+            f.write("new\n")
+
+        # restrict to src/ only
+        result = runner.invoke(cli, ["--since", "HEAD", "src"])
+        assert result.exit_code == 0
+        out = result.output
+        assert "src/a.py" in out
+        assert "tests/t_test.py" not in out
